@@ -127,7 +127,7 @@ Known gaps, tracked as open issues rather than left implicit:
 
 ## Fuzz Testing (zksoroban#37)
 
-The project includes fuzz tests for the `verify_proof` function with randomized `BytesN<64>`, `BytesN<128>`, and `BytesN<32>` inputs. These tests run 100 random combinations per invocation to assert no panic/contract trap occurs, and only valid `Ok(true)`/`Ok(false)`/`Err(...)` outcomes are observed.
+The project includes fuzz tests for the `verify_proof` function with randomized `BytesN<64>`, `BytesN<128>`, and `BytesN<32>` inputs. These tests run 1000 random combinations per invocation to assert no panic/contract trap occurs, and only valid `Ok(true)`/`Ok(false)`/`Err(...)` outcomes are observed.
 
 To run the fuzz tests:
 

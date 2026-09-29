@@ -1729,12 +1729,20 @@ fn never_expires(env: &Env) -> BytesN<32> {
 fn random_bytes_64(rng: &mut rand::rngs::ThreadRng) -> [u8; 64] {
     let mut arr = [0u8; 64];
     rng.fill(&mut arr);
+    arr[63] &= 0xfc;
+    arr[62] &= 0x3f;
+    arr[0] &= 0x7f;
     arr
 }
 
 fn random_bytes_128(rng: &mut rand::rngs::ThreadRng) -> [u8; 128] {
     let mut arr = [0u8; 128];
     rng.fill(&mut arr);
+    arr[127] &= 0xfc;
+    arr[126] &= 0xfc;
+    arr[125] &= 0xfc;
+    arr[124] &= 0xfc;
+    arr[0] &= 0x7f;
     arr
 }
 
@@ -1755,7 +1763,7 @@ fn fuzz_verify_proof_random_proof_a_64() {
     env.ledger().with_mut(|li| li.sequence_number = 100);
     let caller = Address::generate(&env);
 
-    for _ in 0..10 {
+    for _ in 0..1000 {
         let proof_a = Bytes::from_array(&env, &random_bytes_64(&mut rng));
         let proof_b = Bytes::from_array(&env, &random_bytes_128(&mut rng));
         let proof_c = Bytes::from_array(&env, &random_bytes_64(&mut rng));
@@ -1780,7 +1788,7 @@ fn fuzz_verify_proof_random_proof_b_128() {
     env.ledger().with_mut(|li| li.sequence_number = 100);
     let caller = Address::generate(&env);
 
-    for _ in 0..10 {
+    for _ in 0..1000 {
         let proof_a = Bytes::from_array(&env, &VALID_PROOF_A);
         let proof_b = Bytes::from_array(&env, &random_bytes_128(&mut rng));
         let proof_c = Bytes::from_array(&env, &VALID_PROOF_C);
@@ -1805,7 +1813,7 @@ fn fuzz_verify_proof_random_public_inputs_32() {
     env.ledger().with_mut(|li| li.sequence_number = 100);
     let caller = Address::generate(&env);
 
-    for _ in 0..10 {
+    for _ in 0..1000 {
         let proof_a = Bytes::from_array(&env, &VALID_PROOF_A);
         let proof_b = Bytes::from_array(&env, &VALID_PROOF_B);
         let proof_c = Bytes::from_array(&env, &VALID_PROOF_C);
@@ -1830,7 +1838,7 @@ fn fuzz_verify_proof_mixed_random_inputs() {
     env.ledger().with_mut(|li| li.sequence_number = 100);
     let caller = Address::generate(&env);
 
-    for _ in 0..10 {
+    for _ in 0..1000 {
         let proof_a = Bytes::from_array(&env, &random_bytes_64(&mut rng));
         let proof_b = Bytes::from_array(&env, &random_bytes_128(&mut rng));
         let proof_c = Bytes::from_array(&env, &random_bytes_64(&mut rng));
