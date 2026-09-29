@@ -4,9 +4,9 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node init && tsc -p tsconfig.json",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "start": "ts-node src/run.ts",
+    "start": "node init && ts-node src/run.ts",
     "demo": "ts-node src/run.ts",
     "estimate-fee": "ts-node src/estimateFee.ts",
     "batch-verify": "ts-node src/batchVerify.ts"
