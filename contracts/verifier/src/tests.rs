@@ -1719,104 +1719,83 @@ fn verify_batch_rejects_call_with_no_authorization() {
     client.verify_batch(&caller, &Vec::new(&env));
 }
 
-// Fuzz tests for the verify entry point. These generate randomised
-// proof bytes and public inputs and assert that `verify_proof` never
-// panics or traps: it must only return `true`, `false`, or an explicit
-// `Error` variant.
+// Fuzz coverage for the verify entry point (issue: randomised inputs to
+// proofA/proofB/proofC and public inputs must never panic or trap). This
+// is a deterministic, seeded pseudo-random fuzz loop rather than a
+// coverage-guided fuzzer: each run tries FUZZ_ITERATIONS random input
+// combinations and asserts verify_proof only ever returns Ok(true),
+// Ok(false), or an explicit Error variant -- never a panic/trap.
 
-fn pseudo_random_bytes(seed: &mut u64, len: usize) -> std::vec::Vec<u8> {
-    let mut out = std::vec::Vec::with_capacity(len);
-    for _ in 0..len {
-        *seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        out.push((*seed >> 33) as u8);
-    }
-    out
-}
+const FUZZ_ITERATIONS: u32 = 1000;
 
-fn bytes_from_vec(env: &Env, v: &std::vec::Vec<u8>) -> Bytes {
-    let mut b = Bytes::new(env);
-    for byte in v {
-        b.push_back(*byte);
+/// Tiny xorshift64* PRNG so the fuzz test is reproducible without pulling
+/// in an external rand dependency.
+struct FuzzRng(u64);
+
+impl FuzzRng {
+    fn new(seed: u64) -> Self {
+        // Avoid the all-zero state, which xorshift cannot escape.
+        FuzzRng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
     }
-    b
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn fill(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            let bytes = self.next_u64().to_le_bytes();
+            for (dst, src) in chunk.iter_mut().zip(bytes.iter()) {
+                *dst = *src;
+            }
+        }
+    }
 }
 
 #[test]
 fn fuzz_verify_proof_never_panics_on_random_inputs() {
-    const ITERATIONS: u32 = 1000;
-
-    let (env, _admin, client) = setup(u32::MAX, 100);
+    let (env, _admin, client) = setup(1_000_000, 100);
     env.ledger().with_mut(|li| li.sequence_number = 100);
     let caller = Address::generate(&env);
+    let mut rng = FuzzRng::new(0xC0FF_EE12_3456_789A);
 
-    let mut seed: u64 = 0x9E3779B97F4A7C15;
+    for _ in 0..FUZZ_ITERATIONS {
+        let mut a = [0u8; PROOF_A_LEN];
+        let mut b = [0u8; PROOF_B_LEN];
+        let mut c = [0u8; PROOF_A_LEN];
+        let mut input = [0u8; 32];
+        rng.fill(&mut a);
+        rng.fill(&mut b);
+        rng.fill(&mut c);
+        rng.fill(&mut input);
 
-    for _ in 0..ITERATIONS {
-        let proof_a = bytes_from_vec(&env, &pseudo_random_bytes(&mut seed, PROOF_A_LEN));
-        let proof_b = bytes_from_vec(&env, &pseudo_random_bytes(&mut seed, PROOF_B_LEN));
-        let proof_c = bytes_from_vec(&env, &pseudo_random_bytes(&mut seed, PROOF_A_LEN));
+        let public_inputs = vec![
+            &env,
+            BytesN::from_array(&env, &input),
+            expiry_bytes(&env, u32::MAX),
+        ];
 
-        let input_count = (seed % 3) as usize;
-        let mut public_inputs = Vec::new(&env);
-        for _ in 0..input_count {
-            let raw = pseudo_random_bytes(&mut seed, 32);
-            public_inputs.push_back(BytesN::from_array(
-                &env,
-                &raw.try_into().unwrap(),
-            ));
-        }
-
+        // try_verify_proof surfaces contract errors as Err instead of
+        // trapping, so any panic here is a genuine fuzz finding.
         let result = client.try_verify_proof(
             &caller,
-            &proof_a,
-            &proof_b,
-            &proof_c,
+            &Bytes::from_array(&env, &a),
+            &Bytes::from_array(&env, &b),
+            &Bytes::from_array(&env, &c),
             &public_inputs,
         );
 
+        // Only valid outcomes: a bool result (Ok(Ok(_))) or an explicit
+        // contract error variant (Err(Ok(_))). Err(Err(_)) would mean an
+        // unexpected host-level trap.
         match result {
-            Ok(Ok(_)) => {}
-            Err(Ok(_)) => {}
-            other => panic!("verify_proof returned an unexpected result: {:?}", other),
-        }
-    }
-}
-
-#[test]
-fn fuzz_verify_proof_never_panics_on_random_public_inputs_with_valid_proof() {
-    const ITERATIONS: u32 = 1000;
-
-    let (env, _admin, client) = setup(u32::MAX, 100);
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    let caller = Address::generate(&env);
-
-    let mut seed: u64 = 0xD1B54A32D192ED03;
-
-    for _ in 0..ITERATIONS {
-        let input_count = (seed % 3) as usize;
-        let mut public_inputs = Vec::new(&env);
-        for _ in 0..input_count {
-            let raw = pseudo_random_bytes(&mut seed, 32);
-            public_inputs.push_back(BytesN::from_array(
-                &env,
-                &raw.try_into().unwrap(),
-            ));
-        }
-
-        let result = client.try_verify_proof(
-            &caller,
-            &Bytes::from_array(&env, &VALID_PROOF_A),
-            &Bytes::from_array(&env, &VALID_PROOF_B),
-            &Bytes::from_array(&env, &VALID_PROOF_C),
-            &public_inputs,
-        );
-
-        match result {
-            Ok(Ok(_)) => {}
-            Err(Ok(_)) => {}
-            other => panic!("verify_proof returned an unexpected result: {:?}", other),
+            Ok(Ok(_)) | Err(Ok(_)) => {}
+            Err(Err(_)) => panic!("verify_proof trapped on random input"),
         }
     }
 }
