@@ -4,7 +4,6 @@ use super::*;
 use soroban_sdk::testutils::storage::Instance as _;
 use soroban_sdk::testutils::storage::Temporary as _;
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke};
-use rand::Rng;
 use soroban_sdk::{vec, Address, Bytes, BytesN, Env, Event as _, IntoVal, String, Vec};
 use zksoroban_verifier_interface::VerifierClient;
 
@@ -1720,131 +1719,104 @@ fn verify_batch_rejects_call_with_no_authorization() {
     client.verify_batch(&caller, &Vec::new(&env));
 }
 
-fn never_expires(env: &Env) -> BytesN<32> {
-    let mut arr = [0u8; 32];
-    arr[28..].copy_from_slice(&u32::MAX.to_be_bytes());
-    BytesN::from_array(env, &arr)
+// Fuzz tests for the verify entry point. These generate randomised
+// proof bytes and public inputs and assert that `verify_proof` never
+// panics or traps: it must only return `true`, `false`, or an explicit
+// `Error` variant.
+
+fn pseudo_random_bytes(seed: &mut u64, len: usize) -> std::vec::Vec<u8> {
+    let mut out = std::vec::Vec::with_capacity(len);
+    for _ in 0..len {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        out.push((*seed >> 33) as u8);
+    }
+    out
 }
 
-fn random_bytes_64(rng: &mut rand::rngs::ThreadRng) -> [u8; 64] {
-    let mut arr = [0u8; 64];
-    rng.fill(&mut arr);
-    arr
+fn bytes_from_vec(env: &Env, v: &std::vec::Vec<u8>) -> Bytes {
+    let mut b = Bytes::new(env);
+    for byte in v {
+        b.push_back(*byte);
+    }
+    b
 }
-
-fn random_bytes_128(rng: &mut rand::rngs::ThreadRng) -> [u8; 128] {
-    let mut arr = [0u8; 128];
-    rng.fill(&mut arr);
-    arr
-}
-
-fn random_public_input(env: &Env, rng: &mut rand::rngs::ThreadRng) -> BytesN<32> {
-    let mut arr = [0u8; 32];
-    rng.fill(&mut arr);
-    BytesN::from_array(env, &arr)
-}
-
-// Fuzz testing for zksoroban#37: verify_proof with randomized BytesN inputs.
-// Runs 1000+ random combinations per test to assert no panic/contract trap;
-// only valid Ok(true)/Ok(false)/Err(...) outcomes.
 
 #[test]
-fn fuzz_verify_proof_random_proof_a_64() {
-    let mut rng = rand::thread_rng();
-    let (env, _admin, client) = setup(10, 100);
+fn fuzz_verify_proof_never_panics_on_random_inputs() {
+    const ITERATIONS: u32 = 1000;
+
+    let (env, _admin, client) = setup(u32::MAX, 100);
     env.ledger().with_mut(|li| li.sequence_number = 100);
     let caller = Address::generate(&env);
 
-    for _ in 0..10 {
-        let proof_a = Bytes::from_array(&env, &random_bytes_64(&mut rng));
-        let proof_b = Bytes::from_array(&env, &random_bytes_128(&mut rng));
-        let proof_c = Bytes::from_array(&env, &random_bytes_64(&mut rng));
-        let public_input = random_public_input(&env, &mut rng);
-        let public_inputs = vec![&env, public_input, never_expires(&env)];
+    let mut seed: u64 = 0x9E3779B97F4A7C15;
 
-        let result = client.verify_proof(
+    for _ in 0..ITERATIONS {
+        let proof_a = bytes_from_vec(&env, &pseudo_random_bytes(&mut seed, PROOF_A_LEN));
+        let proof_b = bytes_from_vec(&env, &pseudo_random_bytes(&mut seed, PROOF_B_LEN));
+        let proof_c = bytes_from_vec(&env, &pseudo_random_bytes(&mut seed, PROOF_A_LEN));
+
+        let input_count = (seed % 3) as usize;
+        let mut public_inputs = Vec::new(&env);
+        for _ in 0..input_count {
+            let raw = pseudo_random_bytes(&mut seed, 32);
+            public_inputs.push_back(BytesN::from_array(
+                &env,
+                &raw.try_into().unwrap(),
+            ));
+        }
+
+        let result = client.try_verify_proof(
             &caller,
             &proof_a,
             &proof_b,
             &proof_c,
             &public_inputs,
         );
-        let _ = result;
+
+        match result {
+            Ok(Ok(_)) => {}
+            Err(Ok(_)) => {}
+            other => panic!("verify_proof returned an unexpected result: {:?}", other),
+        }
     }
 }
 
 #[test]
-fn fuzz_verify_proof_random_proof_b_128() {
-    let mut rng = rand::thread_rng();
-    let (env, _admin, client) = setup(10, 100);
+fn fuzz_verify_proof_never_panics_on_random_public_inputs_with_valid_proof() {
+    const ITERATIONS: u32 = 1000;
+
+    let (env, _admin, client) = setup(u32::MAX, 100);
     env.ledger().with_mut(|li| li.sequence_number = 100);
     let caller = Address::generate(&env);
 
-    for _ in 0..10 {
-        let proof_a = Bytes::from_array(&env, &VALID_PROOF_A);
-        let proof_b = Bytes::from_array(&env, &random_bytes_128(&mut rng));
-        let proof_c = Bytes::from_array(&env, &VALID_PROOF_C);
-        let public_input = random_public_input(&env, &mut rng);
-        let public_inputs = vec![&env, public_input, never_expires(&env)];
+    let mut seed: u64 = 0xD1B54A32D192ED03;
 
-        let result = client.verify_proof(
+    for _ in 0..ITERATIONS {
+        let input_count = (seed % 3) as usize;
+        let mut public_inputs = Vec::new(&env);
+        for _ in 0..input_count {
+            let raw = pseudo_random_bytes(&mut seed, 32);
+            public_inputs.push_back(BytesN::from_array(
+                &env,
+                &raw.try_into().unwrap(),
+            ));
+        }
+
+        let result = client.try_verify_proof(
             &caller,
-            &proof_a,
-            &proof_b,
-            &proof_c,
+            &Bytes::from_array(&env, &VALID_PROOF_A),
+            &Bytes::from_array(&env, &VALID_PROOF_B),
+            &Bytes::from_array(&env, &VALID_PROOF_C),
             &public_inputs,
         );
-        let _ = result;
-    }
-}
 
-#[test]
-fn fuzz_verify_proof_random_public_inputs_32() {
-    let mut rng = rand::thread_rng();
-    let (env, _admin, client) = setup(10, 100);
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    let caller = Address::generate(&env);
-
-    for _ in 0..10 {
-        let proof_a = Bytes::from_array(&env, &VALID_PROOF_A);
-        let proof_b = Bytes::from_array(&env, &VALID_PROOF_B);
-        let proof_c = Bytes::from_array(&env, &VALID_PROOF_C);
-        let public_input = random_public_input(&env, &mut rng);
-        let public_inputs = vec![&env, public_input, never_expires(&env)];
-
-        let result = client.verify_proof(
-            &caller,
-            &proof_a,
-            &proof_b,
-            &proof_c,
-            &public_inputs,
-        );
-        let _ = result;
-    }
-}
-
-#[test]
-fn fuzz_verify_proof_mixed_random_inputs() {
-    let mut rng = rand::thread_rng();
-    let (env, _admin, client) = setup(10, 100);
-    env.ledger().with_mut(|li| li.sequence_number = 100);
-    let caller = Address::generate(&env);
-
-    for _ in 0..10 {
-        let proof_a = Bytes::from_array(&env, &random_bytes_64(&mut rng));
-        let proof_b = Bytes::from_array(&env, &random_bytes_128(&mut rng));
-        let proof_c = Bytes::from_array(&env, &random_bytes_64(&mut rng));
-        let public_input1 = random_public_input(&env, &mut rng);
-        let public_input2 = random_public_input(&env, &mut rng);
-        let public_inputs = vec![&env, public_input1, public_input2];
-
-        let result = client.verify_proof(
-            &caller,
-            &proof_a,
-            &proof_b,
-            &proof_c,
-            &public_inputs,
-        );
-        let _ = result;
+        match result {
+            Ok(Ok(_)) => {}
+            Err(Ok(_)) => {}
+            other => panic!("verify_proof returned an unexpected result: {:?}", other),
+        }
     }
 }
