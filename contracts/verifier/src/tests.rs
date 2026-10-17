@@ -1,5 +1,7 @@
 extern crate std;
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::testutils::storage::Instance as _;
 use soroban_sdk::testutils::storage::Temporary as _;
@@ -1719,83 +1721,176 @@ fn verify_batch_rejects_call_with_no_authorization() {
     client.verify_batch(&caller, &Vec::new(&env));
 }
 
-// Fuzz coverage for the verify entry point (issue: randomised inputs to
-// proofA/proofB/proofC and public inputs must never panic or trap). This
-// is a deterministic, seeded pseudo-random fuzz loop rather than a
-// coverage-guided fuzzer: each run tries FUZZ_ITERATIONS random input
-// combinations and asserts verify_proof only ever returns Ok(true),
-// Ok(false), or an explicit Error variant -- never a panic/trap.
+// Fuzz tests (zksoroban#fuzz). These generate randomised proof bytes and
+// public inputs and assert that `verify_proof` never panics or traps: it
+// must always return `Ok(true)`, `Ok(false)`, or an explicit `Error`
+// variant. A deterministic PRNG is used (rather than `rand`) so the test
+// is reproducible and needs no extra dependency; the seed is fixed but the
+// generated inputs are effectively random from the contract's perspective.
 
-const FUZZ_ITERATIONS: u32 = 1000;
-
-/// Tiny xorshift64* PRNG so the fuzz test is reproducible without pulling
-/// in an external rand dependency.
-struct FuzzRng(u64);
+/// A tiny, dependency-free xorshift64* PRNG. Deterministic given a seed,
+/// which is exactly what we want for a reproducible fuzz run.
+struct FuzzRng {
+    state: u64,
+}
 
 impl FuzzRng {
     fn new(seed: u64) -> Self {
-        // Avoid the all-zero state, which xorshift cannot escape.
-        FuzzRng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        // xorshift requires a non-zero state.
+        Self {
+            state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
+        let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
         x ^= x >> 27;
-        self.0 = x;
+        self.state = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
     fn fill(&mut self, buf: &mut [u8]) {
-        for chunk in buf.chunks_mut(8) {
-            let bytes = self.next_u64().to_le_bytes();
-            for (dst, src) in chunk.iter_mut().zip(bytes.iter()) {
-                *dst = *src;
-            }
+        let mut i = 0;
+        while i < buf.len() {
+            let word = self.next_u64().to_le_bytes();
+            let take = std::cmp::min(8, buf.len() - i);
+            buf[i..i + take].copy_from_slice(&word[..take]);
+            i += take;
         }
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        if bound == 0 {
+            0
+        } else {
+            self.next_u64() % bound
+        }
+    }
+}
+
+fn random_bytes_n<const N: usize>(env: &Env, rng: &mut FuzzRng) -> BytesN<N> {
+    let mut arr = [0u8; N];
+    rng.fill(&mut arr);
+    BytesN::from_array(env, &arr)
+}
+
+/// The number of random input combinations each fuzz test tries. The
+/// acceptance criterion is "at minimum 1000"; we run a bit more to give
+/// better coverage without making the suite noticeably slower.
+const FUZZ_ITERATIONS: u32 = 1500;
+
+/// Asserts that a `try_verify_proof` result is one of the shapes the
+/// contract is allowed to produce: `Ok(true)`, `Ok(false)`, or an
+/// explicit `Err(Ok(Error::_))`. Anything else (a trap, a panic, an
+/// unexpected error type) fails the test.
+fn assert_valid_verify_outcome(
+    result: Result<Result<bool, Error>, Result<Error, soroban_sdk::InvokeError>>,
+) {
+    match result {
+        Ok(Ok(true)) | Ok(Ok(false)) => {}
+        Err(Ok(_explicit_error)) => {}
+        other => panic!("verify_proof produced an invalid outcome: {:?}", other),
     }
 }
 
 #[test]
 fn fuzz_verify_proof_never_panics_on_random_inputs() {
-    let (env, _admin, client) = setup(1_000_000, 100);
-    env.ledger().with_mut(|li| li.sequence_number = 100);
+    let (env, _admin, client) = setup(u32::MAX, 100);
+    // Keep the ledger well past any expiry we might generate so the
+    // expiry path is exercised too, not just short-circuited.
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
     let caller = Address::generate(&env);
+
     let mut rng = FuzzRng::new(0xC0FF_EE12_3456_789A);
 
-    for _ in 0..FUZZ_ITERATIONS {
-        let mut a = [0u8; PROOF_A_LEN];
-        let mut b = [0u8; PROOF_B_LEN];
-        let mut c = [0u8; PROOF_A_LEN];
-        let mut input = [0u8; 32];
-        rng.fill(&mut a);
-        rng.fill(&mut b);
-        rng.fill(&mut c);
-        rng.fill(&mut input);
+    for i in 0..FUZZ_ITERATIONS {
+        let proof_a = random_bytes_n::<64>(&env, &mut rng);
+        let proof_b = random_bytes_n::<128>(&env, &mut rng);
+        let proof_c = random_bytes_n::<64>(&env, &mut rng);
 
-        let public_inputs = vec![
-            &env,
-            BytesN::from_array(&env, &input),
-            expiry_bytes(&env, u32::MAX),
-        ];
+        // Randomise the number of public inputs (0..=3) and their bytes,
+        // so both the wrong-count path and the pairing path get hit.
+        let input_count = rng.below(4) as u32;
+        let mut public_inputs = Vec::new(&env);
+        for _ in 0..input_count {
+            public_inputs.push_back(random_bytes_n::<32>(&env, &mut rng));
+        }
 
-        // try_verify_proof surfaces contract errors as Err instead of
-        // trapping, so any panic here is a genuine fuzz finding.
         let result = client.try_verify_proof(
             &caller,
-            &Bytes::from_array(&env, &a),
-            &Bytes::from_array(&env, &b),
-            &Bytes::from_array(&env, &c),
+            &Bytes::from_array(&env, &proof_a.to_array()),
+            &Bytes::from_array(&env, &proof_b.to_array()),
+            &Bytes::from_array(&env, &proof_c.to_array()),
             &public_inputs,
         );
 
-        // Only valid outcomes: a bool result (Ok(Ok(_))) or an explicit
-        // contract error variant (Err(Ok(_))). Err(Err(_)) would mean an
-        // unexpected host-level trap.
-        match result {
-            Ok(Ok(_)) | Err(Ok(_)) => {}
-            Err(Err(_)) => panic!("verify_proof trapped on random input"),
+        assert_valid_verify_outcome(result);
+
+        // Advance the ledger a little each iteration so the expiry and
+        // rate-limit window logic sees varying state.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1000 + i;
+        });
+    }
+}
+
+#[test]
+fn fuzz_verify_proof_never_panics_with_random_public_inputs_only() {
+    // Holds the proof bytes fixed at the known-valid fixture and only
+    // randomises the public inputs, isolating the public-input parsing
+    // and hashing paths from the pairing math.
+    let (env, _admin, client) = setup(u32::MAX, 100);
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
+    let caller = Address::generate(&env);
+
+    let mut rng = FuzzRng::new(0x1234_5678_9ABC_DEF0);
+
+    for _ in 0..FUZZ_ITERATIONS {
+        let input_count = rng.below(4) as u32;
+        let mut public_inputs = Vec::new(&env);
+        for _ in 0..input_count {
+            public_inputs.push_back(random_bytes_n::<32>(&env, &mut rng));
         }
+
+        let result = client.try_verify_proof(
+            &caller,
+            &Bytes::from_array(&env, &VALID_PROOF_A),
+            &Bytes::from_array(&env, &VALID_PROOF_B),
+            &Bytes::from_array(&env, &VALID_PROOF_C),
+            &public_inputs,
+        );
+
+        assert_valid_verify_outcome(result);
+    }
+}
+
+#[test]
+fn fuzz_verify_proof_never_panics_with_random_proof_bytes_only() {
+    // Holds the public inputs fixed at the known-valid fixture and only
+    // randomises the proof bytes, isolating the G1/G2 deserialisation and
+    // pairing paths.
+    let (env, _admin, client) = setup(u32::MAX, 100);
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
+    let caller = Address::generate(&env);
+    let public_inputs = public_inputs_with_expiry(&env, u32::MAX);
+
+    let mut rng = FuzzRng::new(0xDEAD_BEEF_CAFE_F00D);
+
+    for _ in 0..FUZZ_ITERATIONS {
+        let proof_a = random_bytes_n::<64>(&env, &mut rng);
+        let proof_b = random_bytes_n::<128>(&env, &mut rng);
+        let proof_c = random_bytes_n::<64>(&env, &mut rng);
+
+        let result = client.try_verify_proof(
+            &caller,
+            &Bytes::from_array(&env, &proof_a.to_array()),
+            &Bytes::from_array(&env, &proof_b.to_array()),
+            &Bytes::from_array(&env, &proof_c.to_array()),
+            &public_inputs,
+        );
+
+        assert_valid_verify_outcome(result);
     }
 }

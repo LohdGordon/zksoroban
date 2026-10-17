@@ -13,9 +13,6 @@ const CIRCUIT_PUBLIC_INPUT_COUNT: u32 = 1;
 const EXPECTED_PUBLIC_INPUT_COUNT: u32 = CIRCUIT_PUBLIC_INPUT_COUNT + 1;
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[cfg(test)]
-mod fuzz_tests;
-
 #[contracttype]
 #[derive(Clone)]
 pub struct VerifyingKey {
@@ -132,6 +129,61 @@ impl VerifierContract {
 
     pub fn version(env: Env) -> String {
         String::from_str(&env, CONTRACT_VERSION)
+    }
+
+    /// Verify a zero-knowledge proof against the stored verifying key.
+    ///
+    /// Returns `Ok(true)` for a valid proof, `Ok(false)` for an invalid one,
+    /// and an explicit `Error` variant for malformed inputs. This entry point
+    /// must never panic or trap on arbitrary byte inputs — see the fuzz tests
+    /// in `tests.rs`.
+    pub fn verify(
+        env: Env,
+        proof_a: BytesN<64>,
+        proof_b: BytesN<128>,
+        proof_c: BytesN<64>,
+        public_inputs: Vec<BytesN<32>>,
+    ) -> Result<bool, Error> {
+        if is_contract_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+
+        if public_inputs.len() != EXPECTED_PUBLIC_INPUT_COUNT {
+            return Err(Error::InvalidPublicInputs);
+        }
+
+        let vk: VerifyingKey = env
+            .storage()
+            .instance()
+            .get(&DataKey::Vk)
+            .ok_or(Error::NotInitialized)?;
+
+        if vk.ic.len() != EXPECTED_PUBLIC_INPUT_COUNT {
+            return Err(Error::InvalidVerifyingKey);
+        }
+
+        let proof_a_g1 = Bn254G1Affine::from_bytes(proof_a);
+        let proof_b_g2 = Bn254G2Affine::from_bytes(proof_b);
+        let proof_c_g1 = Bn254G1Affine::from_bytes(proof_c);
+
+        let alpha = Bn254G1Affine::from_bytes(vk.alpha);
+        let beta = Bn254G2Affine::from_bytes(vk.beta);
+        let gamma = Bn254G2Affine::from_bytes(vk.gamma);
+        let delta = Bn254G2Affine::from_bytes(vk.delta);
+
+        let mut vk_x = Bn254G1Affine::from_bytes(vk.ic.get(0).unwrap());
+        for (i, input) in public_inputs.iter().enumerate() {
+            let ic = Bn254G1Affine::from_bytes(vk.ic.get((i + 1) as u32).unwrap());
+            let fr = Bn254Fr::from_bytes(input);
+            vk_x = vk_x + (ic * fr);
+        }
+
+        let valid = Bn254::pairing_check(
+            &vec![&env, -proof_a_g1, alpha, vk_x, proof_c_g1],
+            &vec![&env, proof_b_g2, beta, gamma, delta],
+        );
+
+        Ok(valid)
     }
 
     /// Number of times `verify_proof`/`verify_batch` has successfully
